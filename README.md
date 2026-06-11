@@ -210,3 +210,119 @@ function safeMerge(target, source) {
 }
 
 This fix blocks the pollution because the \_\_proto\_\_ key is never passed to any assignment operation — it is skipped entirely on every recursive call. A complementary fix is to use JSON.parse with a reviver that rejects these keys, or to use Object.create(null) for target so it has no prototype to pollute.
+
+
+# Lab 4 — Bypassing Flawed Input Filters for Server-Side Prototype Pollution
+
+## Step 1 — Explore the Application and Identify the Filter
+
+After logging in as the regular user "wiener", the address update form under **My Account** was submitted. Burp Suite intercepted the outgoing `POST /my-account/change-address` request. The request body contained the standard address fields along with a `sessionId` cookie.
+
+An initial test confirmed that the server had introduced a basic input filter: sending `"__proto__": { "isAdmin": true }` was now being blocked or stripped. This indicated the developer had added a check against the `__proto__` key specifically — but had not considered alternative paths through the prototype chain.
+
+*Figure 4a: My Account page for user "wiener" — standard non-privileged account view prior to exploitation*
+
+![alt text](<ss/Screenshot from 2026-06-09 23-03-07.png>)
+
+*Figure 4b: Burp Suite — original POST `/my-account/change-address` request showing the baseline JSON body with address fields and sessionId*
+
+![alt text](<ss/Screenshot from 2026-06-09 23-03-26.png>)
+
+## Step 2 — Bypass the Filter Using `constructor.prototype`
+
+Because `__proto__` was being filtered, an alternative path to `Object.prototype` was used. In JavaScript, every function object has a `prototype` property, and every object has a `constructor` property that points back to the function that created it. For a plain object `{}`, `obj.constructor` is `Object`, and `obj.constructor.prototype` is `Object.prototype` — the exact same reference that `obj.__proto__` would return.
+
+The payload was crafted using this alternative path:
+
+```json
+{
+  "address_line_1": "Wiener HQ",
+  "address_line_2": "One Wiener Way",
+  "city": "Wienerville",
+  "postcode": "BU1 1RP",
+  "country": "UK",
+  "sessionId": "nLdhF7HsIWxKTCyrz1sDeUqOSi8YRapj",
+  "constructor": {
+    "prototype": {
+      "isAdmin": true
+    }
+  }
+}
+```
+
+The server's merge function recursively walked the JSON body. When it reached the key `constructor`, it retrieved the actual `Object` constructor function. Then, when it walked into the `prototype` key on that function, it accessed `Object.prototype` directly. Finally, assigning `isAdmin: true` there polluted `Object.prototype` — bypassing the `__proto__` blocklist entirely because the key `__proto__` was never used.
+
+The server responded with `"isAdmin": true` in the returned user object, confirming the pollution had succeeded.
+
+*Figure 4c: Burp Repeater — modified request using `constructor.prototype` path (left) and server response showing `"isAdmin": true` (right), confirming successful filter bypass*
+
+![alt text](<ss/Screenshot from 2026-06-09 23-04-00.png>)
+
+## Step 3 — Solve the Lab
+
+With `isAdmin: true` now reflected on the server's `Object.prototype`, the page was reloaded. The navigation bar displayed an **Admin panel** link. Navigating to the admin panel revealed the Users list. The user **"carlos"** was deleted, solving the lab.
+
+*Figure 4d: Lab solved confirmation — "Bypassing flawed input filters for server-side prototype pollution" marked Solved; "User deleted successfully!" message visible*
+
+![alt text](<ss/Screenshot from 2026-06-09 23-04-28.png>)
+
+## Summary — Lab 4
+
+This lab demonstrated how a naive blocklist defence against server-side prototype pollution can be bypassed. The developer patched the vulnerable merge function by checking for the key `__proto__` and skipping it — however, `__proto__` is not the only path that reaches `Object.prototype`. The JavaScript prototype chain can be traversed equally through `constructor.prototype`: for any plain object, `obj.constructor` returns the `Object` function, and `obj.constructor.prototype` returns `Object.prototype` itself. Because the merge function recursively walked all keys in the JSON body and the filter only blocked the literal string `"__proto__"`, the alternative path went through unchecked. The recursive merge then set `isAdmin = true` directly on `Object.prototype`, giving the attacker admin privileges across the entire Node.js process — with the same persistence and blast radius as in Lab 3. This shows that blocklist approaches are fundamentally fragile against prototype pollution: there are multiple paths to the same target, and missing even one makes the fix ineffective.
+
+### Question 4.1
+
+**Explain WHY the path `constructor.prototype` leads to the same `Object.prototype` as `__proto__`. Use the prototype chain diagram from Chapter 6 to support your answer.**
+
+In JavaScript, every object holds an internal `[[Prototype]]` slot which points to its prototype object. For a plain object literal `obj = {}`, this slot points to `Object.prototype`. The `__proto__` accessor is simply a getter/setter that reads and writes this `[[Prototype]]` slot directly — so `obj.__proto__ === Object.prototype` evaluates to `true`.
+
+The `constructor.prototype` path reaches the same destination via a different route. Every object also has a `constructor` own property inherited from its prototype. For a plain object, `obj.constructor` resolves (through the prototype chain) to the built-in `Object` function. Every JavaScript function, in turn, has a `prototype` property: for the `Object` function specifically, `Object.prototype` is the very same object that all plain objects inherit from. Therefore `obj.constructor.prototype === Object.prototype` is also `true`.
+
+The prototype chain diagram from Chapter 6 illustrates this clearly:
+
+```
+obj  ──[[Prototype]]──►  Object.prototype  ──[[Prototype]]──►  null
+ │                            ▲
+ │  .constructor              │  .prototype
+ └────────────────►  Object ──┘
+```
+
+Both arrows — `obj.__proto__` and `obj.constructor.prototype` — point to the same node in the diagram: `Object.prototype`. A vulnerable recursive merge that follows object keys without restriction can reach that node through the `constructor → prototype` path just as easily as through `__proto__`, since both are ordinary property lookups in JavaScript.
+
+### Question 4.2
+
+**The developer now also blocks the key `"constructor"`. Is the application fully protected? Describe what a truly robust fix looks like — not just a blocklist approach.**
+
+No, the application is not fully protected. Blocklists are inherently fragile because they enumerate known-bad inputs rather than defining what is safe. The JavaScript prototype chain can be reached through multiple paths — `__proto__`, `constructor.prototype`, and potentially through nested combinations or future engine quirks. Adding `constructor` to the blocklist closes one more hole, but the developer must perfectly predict every possible path an attacker might use, now and in the future. Missing even one path reopens the vulnerability.
+
+A truly robust fix does not rely on blocking specific keys. Instead, it addresses the problem structurally:
+
+**1. Use `Object.create(null)` for all merge targets.**
+Creating the target object with `Object.create(null)` gives it no prototype at all — its `[[Prototype]]` slot is `null`. Even if an attacker manages to assign a property through some path, there is no `Object.prototype` to pollute, so the assignment is harmless.
+
+```javascript
+const target = Object.create(null);
+```
+
+**2. Use `Object.hasOwn()` to restrict key assignment to own properties only.**
+Instead of walking into inherited properties, use `Object.hasOwn(source, key)` to ensure only the source object's own keys are merged, preventing traversal into `constructor` or prototype chain properties.
+
+**3. Replace recursive merge with schema validation.**
+The most robust approach is to never merge raw user-supplied JSON onto internal objects at all. Instead, validate the incoming JSON against a strict schema (for example, using a library such as `ajv`) that defines exactly which keys are permitted and what types they must have. Any key not in the allowlist is rejected before it reaches the merge step.
+
+**4. Use `JSON.parse` with a reviver function.**
+When deserialising user input, a reviver can intercept every key–value pair and throw or return `undefined` for any key matching `__proto__`, `constructor`, or `prototype`:
+
+```javascript
+JSON.parse(userInput, (key, value) => {
+  if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+    return undefined;
+  }
+  return value;
+});
+```
+
+**5. Apply `Object.freeze(Object.prototype)` at server startup.**
+Freezing `Object.prototype` prevents any property from being added to it at runtime. This is a defence-in-depth measure and should not be relied upon alone, but it stops pollution from having any effect even if a vulnerable merge path exists.
+
+The combination of schema validation (to reject unexpected keys early), `Object.create(null)` targets (to remove the prototype to pollute), and `Object.freeze(Object.prototype)` (as a last line of defence) forms a defence-in-depth strategy that does not depend on maintaining an ever-growing blocklist.
